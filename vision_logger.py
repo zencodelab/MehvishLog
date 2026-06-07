@@ -1,21 +1,51 @@
 import cv2
 import time
 import datetime
-from mlx_vlm import load, generate
-from mlx_vlm.prompt_utils import apply_chat_template
+import base64
+import ollama
 
 # Configuration
-MODEL_PATH = "mlx-community/Qwen2-VL-2B-Instruct-4bit"
+MODEL_NAME = "gemma4:12b"
 LOG_FILE = "m4_vision_log.txt"
-IMAGE_PATH = "/tmp/vision_logger_frame.jpg"
-INTERVAL_SECONDS = 5
-MOTION_THRESHOLD = 500  # Number of changed pixels to trigger motion
-DIFF_THRESHOLD = 25     # Intensity difference to consider a pixel changed
+INTERVAL_SECONDS = 10    # Seconds between VLM analyses (10s recommended for 12B model)
+MOTION_THRESHOLD = 500   # Number of changed pixels to trigger motion
+DIFF_THRESHOLD = 25      # Intensity difference to consider a pixel changed
+
+PROMPT = "Describe this scene accurately in one brief sentence."
+
+
+def encode_frame(frame):
+    """Encode an OpenCV frame to base64 JPEG for the Ollama API."""
+    _, buffer = cv2.imencode(".jpg", frame)
+    return base64.b64encode(buffer).decode("utf-8")
+
+
+def describe_frame(frame):
+    """Send a frame to Gemma 4 via Ollama and return the description."""
+    image_b64 = encode_frame(frame)
+    response = ollama.chat(
+        model=MODEL_NAME,
+        messages=[
+            {
+                "role": "user",
+                "content": PROMPT,
+                "images": [image_b64],
+            }
+        ],
+    )
+    return response.message.content.replace("\n", " ").strip()
+
 
 def main():
-    print(f"Loading MLX-VLM model: {MODEL_PATH}...")
-    model, processor = load(MODEL_PATH)
-    print("Model loaded successfully.")
+    # Verify Ollama connection and model availability
+    print(f"Connecting to Ollama (model: {MODEL_NAME})...")
+    try:
+        ollama.show(MODEL_NAME)
+        print("Model ready.")
+    except ollama.ResponseError:
+        print(f"Model '{MODEL_NAME}' not found. Pulling it now (this may take a few minutes)...")
+        ollama.pull(MODEL_NAME)
+        print("Model pulled successfully.")
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -34,75 +64,55 @@ def main():
                 print("Failed to grab frame.")
                 time.sleep(1)
                 continue
-            
+
             # Convert to grayscale and blur to reduce noise
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             gray = cv2.GaussianBlur(gray, (21, 21), 0)
-            
+
             motion_detected = False
-            
+
             if prev_gray is not None:
                 # Compute absolute difference
                 frame_delta = cv2.absdiff(prev_gray, gray)
                 thresh = cv2.threshold(frame_delta, DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)[1]
                 thresh = cv2.dilate(thresh, None, iterations=2)
-                
+
                 # Check how much changed
                 non_zero_count = cv2.countNonZero(thresh)
                 if non_zero_count > MOTION_THRESHOLD:
                     motion_detected = True
-                    
+
             prev_gray = gray
-            
+
             current_time = time.time()
-            
+
             # Only process if motion detected AND interval elapsed
             if motion_detected and (current_time - last_process_time) >= INTERVAL_SECONDS:
                 print("Motion detected. Processing frame...")
-                
-                # Save frame to disk for the model
-                cv2.imwrite(IMAGE_PATH, frame)
-                
-                # Generate description
-                raw_prompt = "Describe this scene accurately in one brief sentence."
-                prompt = apply_chat_template(
-                    processor,
-                    getattr(model, "config", {}),
-                    raw_prompt,
-                    num_images=1
-                )
+
                 try:
-                    output = generate(
-                        model=model,
-                        processor=processor,
-                        prompt=prompt,
-                        image=IMAGE_PATH,
-                        max_tokens=60,
-                        verbose=False
-                    )
-                    
-                    # Clean output
-                    description = output.replace('\n', ' ').strip()
-                    
+                    description = describe_frame(frame)
+
                     # Log to file
                     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     log_entry = f"[{timestamp}] {description}\n"
-                    
+
                     with open(LOG_FILE, "a") as f:
                         f.write(log_entry)
-                        
+
                     print(f"Logged: {log_entry.strip()}")
-                    
+
                 except Exception as e:
                     print(f"Error during VLM generation: {e}")
-                    
+
                 last_process_time = current_time
-                
+
     except KeyboardInterrupt:
         print("\nStopping vision logger...")
     finally:
         cap.release()
         print("Webcam released.")
+
 
 if __name__ == "__main__":
     main()

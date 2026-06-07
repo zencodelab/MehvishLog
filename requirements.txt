@@ -1,2 +1,2 @@
-mlx-vlm
+ollama
 opencv-python
